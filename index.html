@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Demo Voice</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            height: 100vh;
+            background-color: black;
+            font-family: Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .container {
+            position: relative;
+            width: 100%;
+            height: 100%;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div id="circle"></div>
+        <div id="status"></div>
+    </div>
+
+    <script>
+        function debounce(func, wait) {
+            let timeout = null;
+            return function(...args) {
+                const context = this;
+                if (timeout !== null) {
+                    clearTimeout(timeout);
+                }
+                timeout = setTimeout(() => func.apply(context, args), wait);
+            };
+        }
+
+        const app = {
+            data() {
+                return {
+                    statusMessage: "Waiting",
+                    socket: null,
+                    audioContext: null,
+                    audioInput: null,
+                    recorder: null,
+                    analyser: null,
+                    audioStream: null,
+                    isRecording: false,
+                    isProcessing: false,
+                    audioData: {
+                        size: 0,
+                        buffer: [],
+                        inputSampleRate: 48000,
+                        outputSampleRate: 16000,
+                        clear: function() {
+                            this.buffer = [];
+                            this.size = 0;
+                        },
+                        input: function(data) {
+                            this.buffer.push(data);
+                            this.size += data.length;
+                        },
+                        getBuffer: function() {
+                            const bytes = new Float32Array(this.size);
+                            let offset = 0;
+                            for (const buffer of this.buffer) {
+                                bytes.set(buffer, offset);
+                                offset += buffer.length;
+                            }
+                            const int16Data = new Int16Array(bytes.length);
+                            for (let i = 0; i < bytes.length; i++) {
+                                int16Data[i] = Math.max(-32768, Math.min(32767, Math.round(bytes[i] * 32767)));
+                            }
+                            return int16Data.buffer;
+                        }
+                    },
+                    host: 'localhost',
+                    port: 27000,
+                    volumeThreshold: 20,
+                    debouncedSendAudioData: null,
+                    sv: true,
+                    speakerVerified: false,
+                    isThinking: false,
+                    isResponding: false,
+                    audioQueue: [],
+                    isPlayingAudio: false,
+                };
+            },
+            methods: {
+                async startListening() {
+                    try {
+                        this.audioStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                        this.audioContext = new AudioContext({ sampleRate: this.audioData.inputSampleRate });
+                        this.audioInput = this.audioContext.createMediaStreamSource(this.audioStream);
+                        this.analyser = this.audioContext.createAnalyser();
+                        this.recorder = this.audioContext.createScriptProcessor(4096, 1, 1);
+
+                        this.audioInput.connect(this.analyser);
+                        this.analyser.connect(this.recorder);
+                        this.recorder.connect(this.audioContext.destination);
+
+                        this.recorder.onaudioprocess = this.onAudioProcess;
+                        this.connectWebSocket();
+                        this.startRecording();
+                        this.animateCircle();
+                        this.updateStatusMessage('Waiting');
+                    } catch (error) {
+                        console.error('Error accessing microphone:', error);
+                        this.updateStatusMessage('Error: ' + error.message);
+                    }
+                },
+                connectWebSocket() {
+                    this.socket = new WebSocket(`ws://${this.host}:${this.port}/ws/transcribe?lang=auto&sv=${this.sv}`);
+                    this.socket.binaryType = 'arraybuffer';
+                    this.socket.onopen = () => {
+                        console.log('WebSocket connected');
+                        this.updateStatusMessage('Connected');
+                    };
+                    this.socket.onclose = () => {
+                        console.log('WebSocket disconnected');
+                        this.updateStatusMessage('Disconnected');
+                        if (this.isThinking || this.isResponding) {
+                            console.log('Attempting to reconnect WebSocket...');
+                            this.connectWebSocket();
+                        }
+                    };
+                    this.socket.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateStatusMessage('WebSocket Error');
+                    };
+
+                    let fullResponse = '';
+                    this.socket.onmessage = async (event) => {
+                        console.log('Received message from server:', event.data);
+                        if (event.data instanceof ArrayBuffer) {
+                            console.log('Received audio data of size:', event.data.byteLength);
+                            const audioBuffer = await this.audioContext.decodeAudioData(event.data);
+                            this.audioQueue.push(audioBuffer);
+
+                            if (!this.isPlayingAudio) {
+                                this.playNextAudio();
+                            }
+                        } else {
+                            const response = JSON.parse(event.data);
+                            console.log('Received JSON response:', response);
+                            if (response.code === 0) {
+                                if (response.msg === "streaming") {
+                                    fullResponse += response.data;
+                                    this.updateStatusMessage(fullResponse);
+                                    this.speakerVerified = true;
+                                    this.isThinking = true;
+                                    this.isResponding = false;
+                                } else if (response.msg === "complete") {
+                                    console.log('Full transcription and LLM response:', fullResponse);
+                                    this.updateStatusMessage(fullResponse);
+                                    fullResponse = '';
+                                    this.isThinking = false;
+                                    this.isResponding = false;
+                                }
+                            } else {
+                                this.updateStatusMessage(`Error: ${response.msg}`);
+                                console.error('Transcription error:', response.msg);
+                                if (response.msg.includes("Speaker verification failed")) {
+                                    this.speakerVerified = false;
+                                    this.stopRecording();
+                                }
+                            }
+                        }
+                    };
+                },
+                async playNextAudio() {
+                    if (this.audioQueue.length > 0 && this.audioContext) {
+                        this.isPlayingAudio = true;
+                        const audioBuffer = this.audioQueue.shift();
+                        const source = this.audioContext.createBufferSource();
+                        source.buffer = audioBuffer;
+                        source.connect(this.audioContext.destination);
+                        source.onended = () => {
+                            this.playNextAudio();
+                        };
+                        console.log('Playing audio chunk');
+                        source.start();
+                    } else {
+                        this.isPlayingAudio = false;
+                        this.isResponding = false;
+                    }
+                },
+                startRecording() {
+                    this.isRecording = true;
+                    this.debouncedSendAudioData = debounce(this.sendAudioData, 100);
+                    this.sendAudioData();
+                },
+                stopRecording() {
+                    this.isRecording = false;
+                    if (this.recorder) {
+                        this.recorder.disconnect();
+                    }
+                    if (this.audioStream) {
+                        this.audioStream.getTracks().forEach(track => track.stop());
+                    }
+                    if (this.socket) {
+                        this.socket.close();
+                    }
+                },
+                sendAudioData() {
+                    if (this.isRecording) {
+                        if (this.socket && this.socket.readyState === WebSocket.OPEN && this.isProcessing) {
+                            const audioBuffer = this.audioData.getBuffer();
+                            console.log('Sending audio data, size:', audioBuffer.byteLength);
+                            this.socket.send(audioBuffer);
+                            this.audioData.clear();
+                        }
+                        setTimeout(this.sendAudioData, 100);
+                    }
+                },
+                onAudioProcess(e) {
+                    if (!this.isThinking && !this.isResponding) {
+                        const inputData = e.inputBuffer.getChannelData(0);
+                        const resampledData = this.downsampleBuffer(inputData, this.audioData.inputSampleRate, this.audioData.outputSampleRate);
+                        this.audioData.input(resampledData);
+                        if (this.debouncedSendAudioData) {
+                            this.debouncedSendAudioData();
+                        }
+                    }
+                },
+                downsampleBuffer(buffer, inputSampleRate, outputSampleRate) {
+                    if (outputSampleRate === inputSampleRate) {
+                        return buffer;
+                    }
+                    const sampleRateRatio = inputSampleRate / outputSampleRate;
+                    const newLength = Math.round(buffer.length / sampleRateRatio);
+                    const result = new Float32Array(newLength);
+                    let offsetResult = 0;
+                    let offsetBuffer = 0;
+                    while (offsetResult < result.length) {
+                        const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
+                        let accum = 0, count = 0;
+                        for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
+                            accum += buffer[i];
+                            count++;
+                        }
+                        result[offsetResult] = accum / count;
+                        offsetResult++;
+                        offsetBuffer = nextOffsetBuffer;
+                    }
+                    return result;
+                },
+                animateCircle() {
+                    if (!this.analyser) return;
+
+                    const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+                    this.analyser.getByteFrequencyData(dataArray);
+
+                    const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+                    const scale = this.easeInOutQuad(average / 100, 1, 0.5, 1);
+
+                    const circle = document.getElementById('circle');
+                    if (circle) {
+                        if (this.isThinking) {
+                            circle.style.animation = 'thinking 2s infinite';
+                            circle.style.transform = 'scale(1)';
+                        } else if (this.isResponding) {
+                            circle.classList.add('ecg');
+                        } else {
+                            circle.classList.remove('ecg');
+                            if (average >= this.volumeThreshold) {
+                                circle.style.animation = 'none';
+                                circle.style.transform = `scale(${scale})`;
+                            } else {
+                                circle.style.animation = 'none';
+                                circle.style.transform = 'scale(1)';
+                            }
+                        }
+                    }
+
+                    if (average < this.volumeThreshold && !this.isThinking && !this.isResponding) {
+                        this.updateStatusMessage('Waiting');
+                        this.isProcessing = false;
+                    } else if (this.isThinking) {
+                        this.updateStatusMessage('Thinking...');
+                        this.isProcessing = true;
+                    } else if (this.isResponding) {
+                        this.updateStatusMessage('Responding...');
+                        this.isProcessing = true;
+                    } else if (this.speakerVerified) {
+                        this.updateStatusMessage('Listening...');
+                        this.isProcessing = true;
+                    } else {
+                        this.updateStatusMessage('Verifying...');
+                        this.isProcessing = true;
+                    }
+
+                    requestAnimationFrame(this.animateCircle);
+                },
+                easeInOutQuad(t, b, c, d) {
+                    t /= d / 2;
+                    if (t < 1) return c / 2 * t * t + b;
+                    t--;
+                    return -c / 2 * (t * (t - 2) - 1) + b;
+                },
+                updateStatusMessage(message) {
+                    const statusElement = document.getElementById('status');
+                    if (statusElement) {
+                        statusElement.innerHTML = '';
+                        const words = message.split(' ');
+                        words.forEach((word, index) => {
+                            const span = document.createElement('span');
+                            span.className = 'status-word';
+                            span.textContent = word;
+                            statusElement.appendChild(span);
+                            if (index < words.length - 1) {
+                                statusElement.appendChild(document.createTextNode(' '));
+                            }
+                        });
+                    }
+                }
+            },
+            mounted() {
+                this.startListening();
+            },
+            beforeUnmount() {
+                this.stopRecording();
+            }
+        };
+
+        // 初始化应用
+        app.mounted();
+    </script>
+</body>
+</html>
